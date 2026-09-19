@@ -31,21 +31,50 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 # Document extraction
 # -----------------------------
 def extract_pdf(file_bytes, filename):
-    """Extract one record per PDF page."""
-    reader = PdfReader(io.BytesIO(file_bytes))
-    records = []
+    """Extract one record per PDF page and handle encrypted PDFs safely."""
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
 
-    for page_number, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        records.append(
-            {
-                "filename": filename,
-                "page": page_number,
-                "text": text.strip(),
-            }
-        )
+        # Some PDFs are encrypted even when they do not require a
+        # password to open. Try the empty password first.
+        if reader.is_encrypted:
+            try:
+                decrypt_result = reader.decrypt("")
 
-    return records
+                if decrypt_result == 0:
+                    raise ValueError(
+                        "This PDF is password-protected. "
+                        "Please remove the password and upload it again."
+                    )
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError(
+                    "This PDF is encrypted and could not be decrypted. "
+                    "Make sure the PDF is not password-protected."
+                ) from exc
+
+        records = []
+
+        for page_number, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            records.append(
+                {
+                    "filename": filename,
+                    "page": page_number,
+                    "text": text.strip(),
+                }
+            )
+
+        return records
+
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(
+            f"Could not read PDF '{filename}'. "
+            "The file may be encrypted, corrupted, or use an unsupported PDF feature."
+        ) from exc
 
 
 def extract_docx(file_bytes, filename):
@@ -323,15 +352,25 @@ def file_fingerprint(files):
 
 
 def prepare_documents(files):
-    """Extract and chunk all supported files."""
+    """Extract and chunk all supported files.
+
+    Returns:
+        extracted: Successfully extracted document records.
+        chunks: Text chunks created from successfully extracted records.
+        errors: Per-file extraction errors.
+    """
     extracted = []
+    errors = []
 
     for filename, file_bytes in files.items():
-        extracted.extend(extract_document(file_bytes, filename))
+        try:
+            extracted.extend(extract_document(file_bytes, filename))
+        except Exception as exc:
+            errors.append(f"{filename}: {exc}")
 
     chunks = chunk_documents(extracted)
 
-    return extracted, chunks
+    return extracted, chunks, errors
 
 
 def get_groq_client():
@@ -468,7 +507,11 @@ if all_files:
     # Only extract, chunk and embed when the document set changes.
     if current_key != st.session_state.document_key:
         with st.spinner("Extracting, chunking and embedding documents..."):
-            extracted, chunks = prepare_documents(all_files)
+            extracted, chunks, extraction_errors = prepare_documents(all_files)
+
+            if extraction_errors:
+                for error in extraction_errors:
+                    st.warning(f"Document skipped: {error}")
 
             if not chunks:
                 st.error("No readable text was found in the selected documents.")
